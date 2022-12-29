@@ -1,0 +1,377 @@
+"""
+Thermoreflectance program with all slow for loops replaced with numpy
+linear algebra operations
+"""
+from calendar import c
+from PIL import Image
+import math
+import os
+import numpy as np
+from argparse import ArgumentParser
+from fastprogress.fastprogress import master_bar, progress_bar
+import time
+import matplotlib.pyplot as plt
+from matplotlib import figure
+import re
+from tkinter import Label
+from tkinter import Button
+from tkinter import Text
+from tkinter import Tk
+from tkinter import Entry
+from scipy import io
+
+np.seterr(divide='ignore', invalid='ignore')
+
+'''
+This section controls the GUI - what is displayed on the window, how it is retrieved, and when it is closed
+'''
+def close_window(root):
+    if input_file != '' and image_root != '' and number_images != '' and freq != '' and output_name != '':
+        root.destroy()
+
+# retrieve_input() is a function with no parameters that returns the user input regarding where to access the images, the name of the images, the number of images, the period of the images, and the output name
+def retrieve_input(in_file_text_box, image_text_box, number_text_box, output_text_box, freq_text_box):
+    global input_file
+    global image_root
+    global number_images
+    global output_name
+    global freq
+    input_file = in_file_text_box.get()
+    image_root = image_text_box.get()
+    number_images = number_text_box.get()
+    output_name = output_text_box.get()
+    freq = freq_text_box.get()
+
+
+def grab_all_images(directory_in, count):
+    data_series = []
+    i = 0
+    
+    print("Grabbing Images")
+    for file in os.listdir(directory_in):
+        if (i >= count):
+            break
+        f = os.path.join(directory_in, file)
+        
+        # check that they are tiffs
+        if f.endswith('.tiff'):
+            processed_image = Image.open(f)
+            # convert image to np array
+            data = np.asarray(processed_image, dtype = "int64")
+            data_series.append(data)
+            processed_image.close()
+            i+=1
+            # cleans out garbage
+            # os.remove(f)
+        else:
+            continue
+            
+    return data_series[0].shape, data_series
+
+
+def grab_all_images_range(directory_in, file_range):
+    data_series = []
+    i = 0
+    
+    print("Grabbing Images")
+    for file in os.listdir(directory_in):
+        if (i + file_range[0] > file_range[-1]):
+            break
+        f = os.path.join(directory_in, file)
+    
+        if f.endswith('.tiff') \
+            and int(re.search(r'\d+', file).group(0)) >= file_range[0] \
+            and int(re.search(r'\d+', file).group(0)) <= file_range[-1]:
+            processed_image = Image.open(f)
+            # convert image to np array
+            data = np.asarray(processed_image, dtype = "int64")
+            data_series.append(data)
+            processed_image.close()
+            i+=1
+            # cleans out garbage
+            # os.remove(f)
+        else:
+            continue
+            
+    return data_series[0].shape, data_series
+
+
+def sine_phase_detect(buckets, height, width):
+    newBuckets = np.zeros((4, height, width))
+    bucket_sums = np.array([buckets[0].sum(), buckets[1].sum(), buckets[2].sum(), buckets[3].sum()])
+    max = np.amax(bucket_sums)
+    max2 = np.amax(np.delete(bucket_sums, np.where(bucket_sums == max)))
+    maxLoc = np.where(bucket_sums == max)[0]
+    maxLoc2 = np.where(bucket_sums == max2)[0]
+
+    dist = maxLoc - maxLoc2
+    current = 0
+
+    if(dist == -1): # maxLoc followed by maxLoc2
+        current = maxLoc
+    elif(dist == 1): # maxLoc2 followed by maxLoc
+        current = maxLoc2
+    else: # large values are at first and last index 
+        current = [3]
+
+    for index, value in np.ndenumerate(bucket_sums):
+        if(current[0] > len(bucket_sums) - 1):
+            current = [0]
+
+        newBuckets[index] = buckets[current[0]]
+        current[0] = current[0] + 1
+ 
+    return newBuckets
+
+
+def bucket_uncertainty(buckets, height, width):
+    newBuckets = np.zeros((4, height, width))
+    bucket_sums = np.array([buckets[0].sum(), buckets[1].sum(), buckets[2].sum(), buckets[3].sum()])
+    
+    if (bucket_sums[0] > bucket_sums[2] 
+        and bucket_sums[0] > bucket_sums[3] 
+        and bucket_sums[1] > bucket_sums[2] 
+        and bucket_sums[1] > bucket_sums[3]):
+        return buckets
+    
+    elif (bucket_sums[1] > bucket_sums[0] 
+        and bucket_sums[1] > bucket_sums[3] 
+        and bucket_sums[2] > bucket_sums[0] 
+        and bucket_sums[2] > bucket_sums[3]):
+        newBuckets[0] = buckets[1]
+        newBuckets[1] = buckets[2]
+        newBuckets[2] = buckets[3]
+        newBuckets[3] = buckets[0]
+        return newBuckets    
+    
+    elif (bucket_sums[2] > bucket_sums[0] 
+        and bucket_sums[2] > bucket_sums[1] 
+        and bucket_sums[3] > bucket_sums[0] 
+        and bucket_sums[3] > bucket_sums[1]):
+        newBuckets[0] = buckets[2]
+        newBuckets[1] = buckets[3]
+        newBuckets[2] = buckets[0]
+        newBuckets[3] = buckets[1]
+        return newBuckets
+    
+    else:
+        newBuckets[0] = buckets[3]
+        newBuckets[1] = buckets[0]
+        newBuckets[2] = buckets[1]
+        newBuckets[3] = buckets[2]
+        return newBuckets
+    
+    
+def bucket_ops_parallel(data_shape, image_series):
+    """Performs the image summation operations
+
+    Args:
+        data_shape (int tuple): [the dimensions of the image (height and width)]
+        image_series (list): [the list of images that will be divided into buckets]
+
+    Returns:
+        list: the four buckets as well as the height and width info
+    """
+    height, width = data_shape
+
+    # split photos into four buckets
+    B1 = image_series[0::4]
+    B2 = image_series[1::4]
+    B3 = image_series[2::4]
+    B4 = image_series[3::4]
+
+    # sums the images in the buckets
+    B1 = np.sum(B1, axis = 0)
+    B2 = np.sum(B2, axis = 0)
+    B3 = np.sum(B3, axis = 0)
+    B4 = np.sum(B4, axis = 0)
+
+    return B1, B2, B3, B4, height, width
+
+
+def phase_ops(B1, B2, B3, B4, height, width, frequency):
+    """
+    takes the four bucket values and uses them to construct phase, dc, modulation amplitude, and change
+    :param input_file: the path to the input image
+    :param freq: the frequency used
+    :return: the phase, dc, modulation amplitude, and change values
+    """
+    phase = np.zeros((height, width))
+
+    # equation for the dc image
+    # dc = (2 * frequency) * (B1 + B2 + B3 + B4)
+    dc = frequency * (B1 + B2 + B3 + B4)
+
+    # equation for modulation amplitude
+    ac = ((math.pi * frequency) / math.sqrt(2)) * np.sqrt(((B1 - B3) * (B1 - B3) + (B2 - B4) * (B2 - B4)))
+
+    # equation for the AMP/dc image
+    change = (math.pi / math.sqrt(2)) * np.divide(np.sqrt((B1 - B3) * (B1 - B3) + (B2 - B4) * (B2 - B4)), B1 + B2 + B3 + B4)
+    # plt.imshow(change, cmap = 'gray')
+
+    # the numerator and denominator of the phase image equation
+    inf_matrix = np.matrix(np.ones((height, width)) * np.inf)
+    numerator = B1 + B2 - B3 - B4
+    denominator = B1 - B2 - B3 + B4
+    
+    # use some linear algebra to get the phase info
+    phase = (2/math.pi) * np.arctan(np.divide(numerator, denominator, out = inf_matrix, where=denominator!=0))
+
+    return dc, ac, change, phase
+
+
+def mk_plots(dc, ac, change, phase, output_name):
+    """
+    takes the dc, ac, change, and phase values and plots them
+    :param input_file: the path to the input image
+    :param freq: the frequency used in analysis
+    :param output_name: the output name of the file
+    :return: pictures of the dc, AC, AC_DC, and phase graphs
+    """
+    # creates the new images based on the name input by the user
+    # plt.imsave(output_name + "_DC.png", dc, cmap='gray', dpi=600)
+    # plt.imsave(output_name + "_AC.png", ac, cmap='gray', dpi=600)
+    # plt.imsave(output_name + "_AC_DC.png", change, cmap='gray', dpi=600)
+    # plt.imsave(output_name + "_Phase.png", phase, cmap='summer', dpi=600)
+    
+    io.savemat(output_name + "_DC.mat", {'data': dc})
+    io.savemat(output_name + "_AC.mat", {'data': ac})
+    io.savemat(output_name + "_AC_DC.mat", {'data': change})
+    io.savemat(output_name + "_Phase.mat", {'data': phase})
+    
+    plt.imsave(output_name + "_DC.png", dc, cmap='gray', dpi=700)
+    plt.imsave(output_name + "_AC.png", ac, cmap='hot', dpi=700)
+    plt.imsave(output_name + "_AC_DC.png", change, cmap='hot', dpi=700)
+    plt.imsave(output_name + "_Phase.png", phase, cmap='jet', dpi=700)
+
+
+def file_ops(directory, count, frequency, outpath):
+    print("Performing operations")
+    data_shape, image_series = grab_all_images(directory, count)
+    B1, B2, B3, B4, height, width = bucket_ops_parallel(data_shape, image_series)
+    adj_B = bucket_uncertainty(np.array([B1, B2, B3, B4]), height, width)
+    new_B1 = adj_B[0]
+    new_B2 = adj_B[1]
+    new_B3 = adj_B[2]
+    new_B4 = adj_B[3] 
+    dc, ac, change, phase = phase_ops(new_B1, new_B2, new_B3, new_B4, height, width, frequency)
+    mk_plots(dc, ac, change, phase, outpath)
+    
+
+def file_ops_partitioned(directory, count, frequency, outpath, image_num=500):
+    # partition = count // 500
+    partition = count // image_num
+    print(str(partition) + " total partitions to process...")
+    #0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+    #0-1000, 1001 - 2000, 2001-3000, 3001-4000, 4001-5000
+    #5001 - 6000, 6001 - 7000, 7001 - 8000, 8001 - 9000, 9001 - 10000
+    B1_t = 0
+    B2_t = 0
+    B3_t = 0
+    B4_t = 0
+    height = 0
+    width = 0
+    for i in range(partition):
+        print("processing partition " + str(i) + " out of " + str(partition))
+        image_range = (0, 0)
+        if (i==0):
+            image_range = (0, image_num - 1)
+        else:
+            image_range = (i * image_num, (i+1) * image_num - 1)
+            
+        batch_data_shape, batch_image_series = grab_all_images_range(directory, image_range) 
+        batch_b1, batch_b2, batch_b3, batch_b4, height, width = bucket_ops_parallel(batch_data_shape, batch_image_series)
+        B1_t = np.add(B1_t, batch_b1)
+        B2_t = np.add(B2_t, batch_b2)
+        B3_t = np.add(B3_t, batch_b3)
+        B4_t = np.add(B4_t, batch_b4)
+    
+    adj_B = bucket_uncertainty(np.array([B1_t, B2_t, B3_t, B4_t]), height, width)
+    new_B1 = adj_B[0]
+    new_B2 = adj_B[1]
+    new_B3 = adj_B[2]
+    new_B4 = adj_B[3] 
+    dc, ac, change, phase = phase_ops(new_B1, new_B2, new_B3, new_B4, height, width, frequency)
+    mk_plots(dc, ac, change, phase, outpath)
+    plt.imshow(ac)
+
+
+def main():
+    """
+    argument parser that reads in command line arguments and runs processing from user parameters
+    :return:
+    """
+    global input_file
+    global image_root
+    global number_images
+    global output_name
+    global freq
+    
+    root = Tk()
+    root.title("Image Details")
+    root.geometry("500x300")
+    in_file_label = Label(root, text="Directory Path:")
+    in_file_label.pack()
+    in_file_text_box = Entry(root, bd=1, width=50)
+    in_file_text_box.pack()
+    image_label = Label(root, text="Image name:")
+    image_label.pack()
+    image_text_box = Entry(root, bd=1, width=50)
+    image_text_box.pack()
+    number_label = Label(root, text="Number of Images:")
+    number_label.pack()
+    number_text_box = Entry(root, bd=1, width=50)
+    number_text_box.pack()
+    frequency_label = Label(root, text="Frequency:")
+    frequency_label.pack()
+    freq_text_box = Entry(root, bd=1, width=50)
+    freq_text_box.pack()
+    exposure_label = Label(root, text="Exposure time: 6Hz: 154 ms, 8Hz: 116 ms, 10Hz: 85 ms")
+    output_label = Label(root, text="Output Name:")
+    output_label.pack()
+    output_text_box = Entry(root, bd=1, width=50)
+    output_text_box.pack()
+    enter_button = Button(root, text="Enter", command = lambda: [retrieve_input(in_file_text_box, image_text_box, number_text_box, 
+                                                                                output_text_box, freq_text_box), close_window(root)])
+    enter_button.pack()
+
+    root.mainloop()
+    # changes the directory to the one selected by the user
+    print("Writing images to: " + input_file + '\n')
+    os.chdir(input_file)
+    
+    # handle \ or no \ issue
+    if (input_file[-1] != '\\'):
+        input_file = input_file + '\\'
+    
+    # algorithm for exposure mapping
+    exposure_map = {"6": "154", "8": "116", "10": "85"}
+    exposure = exposure_map[freq]
+    
+    try:
+        os.mkdir(output_name)
+    except:
+        print("This output directory name already exists. \n")
+        output_name = output_name + '1'
+        os.mkdir(output_name)
+        print("New output directory at: " + output_name + '\n')
+    
+    graph_out = input_file + output_name + "\\"
+    os.system("takestream -f " + input_file + "image%.tiff -n " + number_images + " -Z+ -e " + exposure)
+    
+    count = int(number_images)
+    frequency = int(freq)
+    
+    # handle count too low issue
+    if (count < 500):
+        file_ops(input_file, count, frequency, graph_out)
+    else:
+        file_ops_partitioned(input_file, count, frequency, graph_out)
+
+
+if __name__ == '__main__':
+    start = time.time()
+    main()
+    end = time.time()
+    print("Completed in: " + str(end - start))
+
